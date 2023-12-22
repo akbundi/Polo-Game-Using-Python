@@ -1,2 +1,2 @@
 # Snooker-Game-Using-Python
-Developed a interactive polo game using python and pygame library
+Developed a interactive snooker game using python and pygame library
