@@ -1,251 +1,627 @@
+import sys
+import socket
+import pickle
+from math import cos, sin, radians, degrees, atan2
+from random import randint
+from cmath import polar
 import pygame
-import pymunk
-import pymunk.pygame_util
-import math
+import pygame.gfxdraw
+import constants as c
+
+
+class Game:
+    
+    # Initializes all variables for the game - some use the classes Pocket, Ball and Menu
+    def __init__(self):
+        self.balls = []
+        self.balls_pocket_even = []
+        self.balls_pocket_odd = []
+        self.balls.append(Ball((600, 220)))
+        for x in range(15):
+            self.balls.append(Ball(c.BALLS_POS[x]))
+            self.balls[x+1].color = c.COLORS[x]
+            self.balls[x+1].number = x+1
+        self.stick = Stick()
+        self.pockets = []
+        self.pockets.append(Pocket(32, 36))
+        self.pockets.append(Pocket(398, 24))
+        self.pockets.append(Pocket(765, 36))
+        self.pockets.append(Pocket(32, 408))
+        self.pockets.append(Pocket(398, 420))
+        self.pockets.append(Pocket(765, 408))
+        self.turn = c.PLAYER1
+        self.must_pocket = c.ANY
+        self.first_pocket = False
+        self.after_hit = False
+        self.even_on_pocket = 0
+        self.odd_on_pocket = 0
+        self.menu = Menu()
+        self.won = False
+        self.sound_effect_count = 0
+        self.cue_on_pocket = False
+        self.sounds_end = False
+        self.acknowledge = False
+        self.remote_force = 0
+        self.remote_angle = 0
+
+    # Draw the background, balls, pockets and stick on the screen
+    def draw(self):
+        for ball in self.balls:
+            if not self.menu.is_connected:
+                ball.move()
+            ball.draw()
+        for pocket in self.pockets:
+            pocket.draw()
+            self.check_pocket(pocket)
+        if not self.has_movement(self.balls):
+            self.stick.draw(self.balls)
+        self.menu.draw(self.must_pocket, self.won)
+
+    # Check if a ball entered the pocket and moves the ball to a different list
+    # Toggles the player turn if the wrong has sunk
+    def check_pocket(self, pocket):
+        if not self.menu.is_connected:
+            for ball in self.balls:
+                distance = calc_distance(ball, pocket)
+                if distance < pocket.radius:
+                    if ball == self.balls[0]:
+                        ball.x = -200
+                        ball.y = -200
+                        ball.velocity = 0
+                        self.toggle_turn()
+                        self.after_hit = False
+                        self.even_on_pocket = len(self.balls_pocket_even)
+                        self.odd_on_pocket = len(self.balls_pocket_odd)
+                        self.cue_on_pocket = True
+                    else:
+                        self.balls.remove(ball)
+                        if ball.number % 2 == 0:
+                            self.balls_pocket_even.append(ball)
+                        else:
+                            self.balls_pocket_odd.append(ball)
+            if self.after_hit and not self.has_movement(self.balls):
+                self.after_hit = False
+                if (self.even_on_pocket == len(self.balls_pocket_even) and
+                    self.odd_on_pocket == len(self.balls_pocket_odd)):
+                    self.toggle_turn()
+                elif self.must_pocket == c.EVEN and self.odd_on_pocket < len(self.balls_pocket_odd):
+                    self.toggle_turn()
+                elif self.must_pocket == c.ODD and self.even_on_pocket < len(self.balls_pocket_even):
+                    self.toggle_turn()
+                self.even_on_pocket = len(self.balls_pocket_even)
+                self.odd_on_pocket = len(self.balls_pocket_odd)
+    
+    # Check the winning conditions
+    # You must pocket all 7 balls (ODD or EVEN) then ball 15
+    # Ball 15 must be the last ball or you lose
+    def check_victory(self):
+        is_15_ingame = False
+        for ball in self.balls:
+            if ball.number == 15:
+                is_15_ingame = True
+        if len(self.balls_pocket_even) == 7 and not is_15_ingame:
+            self.won = True
+            if self.turn == c.PLAYER1:
+                return c.PLAYER1
+            else:
+                return c.PLAYER2
+        elif len(self.balls_pocket_odd) == 8:
+            self.won = True
+            if self.turn == c.PLAYER1:
+                return c.PLAYER1
+            else:
+                return c.PLAYER2
+        elif (not is_15_ingame) and len(self.balls_pocket_even) < 7 and len(self.balls_pocket_odd) < 8:
+            self.won = True
+            if self.turn == c.PLAYER1:
+                return c.PLAYER2
+            else:
+                return c.PLAYER1
+        return False
+    
+    def click_handle(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            self.menu.click_handle()
+            if not self.has_movement(self.balls) and event.button == c.LEFT_CLICK:
+                self.stick.is_charging = True
+                
+        elif event.type == pygame.MOUSEBUTTONUP:
+            if not self.has_movement(self.balls) and event.button == c.LEFT_CLICK:
+                self.stick.is_charging = False
+                self.stick.hit = True
+                self.stick.hit_force = (self.stick.dist_to_ball - 180) * 0.15
+            if not self.has_movement(self.balls) and event.button == c.RIGHT_CLICK:
+                self.stick.dist_to_ball = 180
+
+    def toggle_turn(self):
+        if self.turn == c.PLAYER1:
+            self.turn = c.PLAYER2
+        else:
+            self.turn = c.PLAYER1
+        if self.must_pocket == c.EVEN:
+            self.must_pocket = c.ODD
+        elif self.must_pocket == c.ODD:
+            self.must_pocket = c.EVEN
+
+    # After the first pocket sets if the player is gonna pocket EVEN or ODD balls
+    def set_player_ball(self):
+        if not self.first_pocket:
+            if self.balls_pocket_even:
+                self.must_pocket = c.EVEN
+                self.first_pocket = True
+                
+            if self.balls_pocket_odd:
+                self.must_pocket = c.ODD
+                self.first_pocket = True
+
+    # Checks for any ball movement
+    # Reposition cue ball if it is out of bounds (was sunk)
+    def has_movement(self, objs):
+        for obj in objs:
+            if obj.velocity > 0:
+                return True
+        if self.balls[0].x < 0:
+            self.balls[0].x = 600
+            self.balls[0].y = 220
+        return False
+
+    # Checks for any collision and defines the resulting velocity and angle for both balls
+    def check_collisions(self):
+        for a in self.balls:
+            for b in self.balls:
+                if a != b and ball_collided(a, b):          
+                    p1 = complex(a.x, a.y)
+                    v1 = complex(a.velocity*cos(radians(a.angle)), a.velocity*sin(radians(a.angle)))
+                    p2 = complex(b.x, b.y)
+                    v2 = complex(b.velocity*cos(radians(b.angle)), b.velocity*sin(radians(b.angle)))
+                    p12 = p1 - p2
+                    d = ((v1 - v2) / p12).real * p12
+
+                    pa = v1 - d
+                    polar_a = polar(pa)
+                    a.velocity = polar_a[0]
+                    a.angle = degrees(polar_a[1])
+
+                    pb = v2 + d
+                    polar_b = polar(pb)
+                    b.velocity = polar_b[0]
+                    b.angle = degrees(polar_b[1])
+                    
+                    fix_overlap(a, b)       
+    
+    # Define the position and draw the pocketed balls at the bottom of the screen
+    def draw_balls_pocket(self):
+        x, y, i, j = 420, 455, 0, 0
+        for ball in self.balls_pocket_even:
+            ball.draw_after_pocket(x+i, y)
+            i += 30
+        for ball in self.balls_pocket_odd:
+            ball.draw_after_pocket(x+j, y+25)
+            j += 30
+    
+    # Function used to generate the sound effects even when the game is over the network
+    # Still needs fixes for some cases when playing connected
+    def sound_effects(self):
+        for a in self.balls:
+            for b in self.balls:
+                if a != b and ball_collided(a, b):             
+                    x = randint(1, 3)
+                    if x==1:
+                        hit_sound1.play()
+                    elif x==2:
+                        hit_sound2.play()
+                    else:
+                        hit_sound3.play()
+            ignore = True if (a.x == -200 and a.y == -200) else False           
+            if a.x == (c.WIDTH - c.MARGIN_RIGHT) - a.radius:
+                hit_wall_sound.play()
+            if a.x == a.radius + c.MARGIN_LEFT and not ignore:
+                hit_wall_sound.play()
+            if a.y == c.HEIGHT - c.MARGIN_BOTTOM - a.radius - c.MENU_HEIGHT:
+                hit_wall_sound.play()
+            if a.y == a.radius + c.MARGIN_TOP and not ignore:
+                hit_wall_sound.play()
+        if self.stick.hit and self.stick.dist_to_ball < 200:
+            hit_cue_sound.play()
+        if len(self.balls) + self.sound_effect_count < 16:
+            pocket_sound.play()
+            self.sound_effect_count += 1
+        if self.cue_on_pocket:
+            pocket_sound.play()
+            self.cue_on_pocket = False
+        if self.menu.winner and not self.sounds_end:
+            self.sounds_end = True
+            victory_sound.play()
+
+
+class Ball:
+
+    def __init__(self, pos=(50, 50), number=0):
+        self.x = pos[0]
+        self.y = pos[1]
+        self.friction = 0.01 #was 0.02 with 60fps
+        self.velocity = 0.0
+        self.angle = 0
+        self.radius = 10
+        self.color = c.WHITE
+        self.number = number
+
+    # Used to set the force of the cue ball when the user hits it
+    def set_force_angle(self, force, angle):
+        self.velocity = force
+        self.angle = angle
+
+    # Used to draw each ball
+    # Antialiased circle was used, you can change both gfxdraw functions to the first commented as needed
+    def draw(self):
+        #pygame.draw.circle(screen, self.color, (int(self.x), int(self.y)), self.radius)
+        pygame.gfxdraw.filled_circle(screen, int(self.x), int(self.y), self.radius, self.color)
+        pygame.gfxdraw.aacircle(screen, int(self.x), int(self.y), self.radius, self.color)
+        text = font.render(str(self.number), True, c.WHITE)
+        xoff = 5
+        yoff = 4
+        if self.number < 10:
+            xoff = 2
+        if self.number != 0:
+            screen.blit(text, (int(self.x) - xoff, int(self.y) - yoff))
+
+    # Moves the ball depending on its velocity
+    # Changes the ball angle when it hits the walls
+    def move(self):
+        self.x = self.x + self.velocity*cos(radians(self.angle))
+        self.y = self.y + self.velocity*sin(radians(self.angle))
+        ignore = True if (self.x == -200 and self.y == -200) else False
+        if self.x > (c.WIDTH - c.MARGIN_RIGHT) - self.radius:
+            self.x = (c.WIDTH - c.MARGIN_RIGHT) - self.radius
+            self.angle = 180 - self.angle
+        if self.x < self.radius + c.MARGIN_LEFT and not ignore:
+            self.x = self.radius + c.MARGIN_LEFT
+            self.angle = 180 - self.angle
+        if self.y > c.HEIGHT - c.MARGIN_BOTTOM - self.radius - c.MENU_HEIGHT:
+            self.y = c.HEIGHT - c.MARGIN_BOTTOM - self.radius - c.MENU_HEIGHT
+            self.angle = 360 - self.angle
+        if self.y < self.radius + c.MARGIN_TOP and not ignore:
+            self.y = self.radius + c.MARGIN_TOP
+            self.angle = 360 - self.angle
+
+        self.velocity -= self.friction
+        if self.velocity < 0:
+            self.velocity = 0
+    
+    # Used to draw individual balls that are pocketed
+    def draw_after_pocket(self, x, y):
+        self.x = x
+        self.y = y
+        pygame.gfxdraw.filled_circle(screen, int(self.x), int(self.y), self.radius, self.color)
+        pygame.gfxdraw.aacircle(screen, int(self.x), int(self.y), self.radius, self.color)
+        text = font.render(str(self.number), True, c.WHITE)
+        xoff = 5
+        yoff = 4
+        if self.number < 10:
+            xoff = 2
+        if self.number != 0:
+            screen.blit(text, (int(self.x) - xoff, int(self.y) - yoff))
+
+
+class Pocket():
+
+    def __init__(self, x, y, r=16):
+        self.x = x
+        self.y = y
+        self.color = c.WHITE
+        self.radius = r
+
+    # Uncomment both lines to make the pockets visible
+    # Can help you reposition or resize the pockets over a new table image
+    def draw(self):
+        #pygame.gfxdraw.filled_circle(screen, int(self.x), int(self.y), self.radius, self.color)
+        #pygame.gfxdraw.aacircle(screen, int(self.x), int(self.y), self.radius, self.color)
+        pass
+                
+
+class Stick:
+
+    def __init__(self):
+        self.x = 0
+        self.y = 0
+        self.angle = 0
+        self.image = stick_img
+        self.rect = self.image.get_rect()
+        self.rect.center = (300, 300)
+        self.original_image = self.image
+        self.dist_to_ball = 180
+        self.is_charging = False
+        self.hit = False
+        self.hit_force = 0
+        self.remote_hit = False
+
+    # Sets the angle of the stick over the cue ball based on the mouse position
+    def set_angle(self, ball_obj, pos=(-100, -100)):
+        if pos[0] == -100:
+            position = pygame.mouse.get_pos()
+        else:
+            position = pos
+        self.x = position[0]
+        self.y = position[1]
+        self.angle = degrees(atan2(ball_obj.y - self.y ,  ball_obj.x - self.x))
+
+    # Draw the stick with a distance of the cue ball according to the charging conditions
+    def draw(self, balls):
+        if self.is_charging:
+            self.dist_to_ball += 0.5
+            if self.dist_to_ball > 250:
+                self.dist_to_ball = 250
+        else:
+            self.dist_to_ball -= 8
+            if self.dist_to_ball < 180:
+                self.dist_to_ball = 180      
+        if self.hit and self.dist_to_ball == 180:
+            self.hit = False
+            if not game.menu.is_hosting or game.turn == c.PLAYER1:
+                balls[0].set_force_angle(self.hit_force, self.angle)
+                game.after_hit = True
+            if game.menu.is_connected and game.turn == c.PLAYER2:
+                self.remote_hit = True
+
+        # Helps rotate the image with less image distortion   
+        self.image = pygame.transform.rotate(self.original_image, -self.angle - 90)
+        x, y = self.rect.center
+        self.rect = self.image.get_rect()
+        angle = self.angle
+        self.x = balls[0].x - self.dist_to_ball * cos(radians(angle))
+        self.y = balls[0].y - self.dist_to_ball * sin(radians(angle))
+        self.rect.center = (int(self.x), int(self.y))
+        screen.blit(self.image, self.rect)
+
+
+def calc_distance(a, b):
+        return ((a.x - b.x)**2 + (a.y - b.y)**2)**(0.5)
+
+
+def ball_collided(ball1, ball2):
+        distance = calc_distance(ball1, ball2)
+        if distance <= (ball1.radius + ball2.radius):
+            return True
+        else:
+            return False
+
+# Moves the ball a little to compensate overlapping problems because of large simulation step
+def fix_overlap(ball1, ball2):
+        distance = calc_distance(ball1, ball2)
+        while distance <= (ball1.radius + ball2.radius + 1):
+            if ball1.x > ball2.x:
+                ball1.x += 0.1
+            else:
+                ball1.x -= 0.1
+            if ball1.y > ball2.y:
+                ball1.y += 0.1
+            else:
+                ball1.y -= 0.1
+            distance = calc_distance(ball1, ball2)
+
+
+class Button:
+
+        def __init__(self, x, y, width, height, text, xoff=0, yoff=0):
+            self.x = x
+            self.y = y
+            self.height = height
+            self.width = width
+            self.background = c.WHITE
+            self.text = text
+            self.x_offset = xoff
+            self.y_offset = yoff
+
+        def draw(self, surface):
+            pygame.draw.rect(surface, self.background, [self.x, self.y, self.width, self.height], 0)
+            pygame.draw.rect(surface, c.BLACK, [self.x, self.y, self.width, self.height], 1)
+            text = font.render(self.text, True, c.BLACK)     
+            surface.blit(text, (self.x + self.x_offset, self.y + self.y_offset))
+        
+        def click_handle(self):
+            pos = pygame.mouse.get_pos()
+            if pos[0] > self.x and pos[1] > self.y and pos[0] < (self.x + self.width) and pos[1] < (self.y + self.height):
+                return True
+            else:
+                return False
+
+
+class Label:
+    
+        def __init__(self, x, y, text=""):
+            self.x = x
+            self.y = y
+            self.text = text
+        
+        def draw(self, surface, text): 
+            tmp = font_medium.render(text, True, c.BLACK)     
+            surface.blit(tmp, (self.x, self.y))
+
+
+class Menu:
+    
+    def __init__(self):
+        self.btn_host = Button(30, 450, 60, 40, "Host", 18, 15)
+        self.btn_connect = Button(100, 450, 60, 40, "Connect", 10, 15)
+        self.btn_host.background = c.GREEN
+        self.is_hosting = False
+        self.btn_connect.background = c.GREEN
+        self.is_connected = False
+        self.lbl_player = Label(200, 460, "")
+        self.winner = 0
+
+    def draw(self, must_pocket, won):
+        self.btn_host.draw(screen)
+        self.btn_connect.draw(screen)
+        winner = False
+        text = ""
+        if must_pocket == c.EVEN:
+            ball_type = "EVEN"
+        elif must_pocket == c.ODD:
+            ball_type = "ODD"
+        else:
+            ball_type = "ANY"
+        if not self.winner:
+            text = "Player {} Turn ({})".format(game.turn, ball_type)
+            self.winner = game.check_victory()
+        if self.winner:
+            text = "Player {} won the game!".format(self.winner)
+        self.lbl_player.draw(screen, text)
+
+    def click_handle(self):
+        if self.btn_host.click_handle():
+            self.is_hosting = True
+            self.btn_host.background = c.RED
+            host()
+        if self.btn_connect.click_handle():
+            self.is_connected = True
+            self.btn_connect.background = c.RED
+            client()
+
+
+def host():
+    # get the hostname
+    host = socket.gethostname()
+    port = PORT
+    SERVER_IP = socket.gethostbyname(host)
+
+    server_socket = socket.socket()
+    server_socket.bind((host, port))
+    print("Server on IP: {} and PORT: {}".format(SERVER_IP, port))
+
+    # configure how many client the server can listen simultaneously
+    server_socket.listen(2)
+    global conn
+    conn, address = server_socket.accept()
+    conn.setblocking(0)
+    print("Connection from: " + str(address))
+
+
+def client():
+    host = IP
+    port = PORT
+    global client_socket
+    client_socket = socket.socket() 
+    client_socket.connect((host, port))
+    client_socket.setblocking(0)
+
+
 
 pygame.init()
+background_img = pygame.image.load('assets/table.png')
+stick_img = pygame.image.load('assets/stick.png')
+icon_img = pygame.image.load('assets/icon.png')
+pygame.display.set_icon(icon_img)
+f = open("ip_port_to_connect.txt", "r")
+IP, PORT = f.read().splitlines()
+PORT = int(PORT)
+f.close()
 
-SCREEN_WIDTH = 1200
-SCREEN_HEIGHT = 678
-BOTTOM_PANEL = 50
+conn = None
+client_socket = None
 
-#game window
-screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT + BOTTOM_PANEL))
-pygame.display.set_caption("Pool")
+font = pygame.font.Font('freesansbold.ttf', 10)
+font_medium = pygame.font.Font('freesansbold.ttf', 16)
+screen = pygame.display.set_mode((c.WIDTH, c.HEIGHT))
+pygame.display.set_caption("Pool Billiards by Raul Vieira")
+hit_sound1 = pygame.mixer.Sound(r"assets/hit1.wav")
+hit_sound2 = pygame.mixer.Sound(r"assets/hit2.wav")
+hit_sound3 = pygame.mixer.Sound(r"assets/hit3.wav")
+pocket_sound = pygame.mixer.Sound(r"assets/pocket.wav")
+hit_cue_sound = pygame.mixer.Sound(r"assets/hit_cue.wav")
+hit_wall_sound = pygame.mixer.Sound(r"assets/wall_hit.wav")
+victory_sound = pygame.mixer.Sound(r"assets/victory.wav")
 
-#pymunk space
-space = pymunk.Space()
-static_body = space.static_body
-draw_options = pymunk.pygame_util.DrawOptions(screen)
+game = Game()
 
-#clock
 clock = pygame.time.Clock()
-FPS = 120
+old_time = 0
 
-#game variables
-lives = 3
-dia = 36
-pocket_dia = 66
-force = 0
-max_force = 10000
-force_direction = 1
-game_running = True
-cue_ball_potted = False
-taking_shot = True
-powering_up = False
-potted_balls = []
+# Main loop
+while True:
+    screen.fill(c.WHITE)
+    screen.blit(background_img, (0, 0))
+    for event in pygame.event.get():
+        if not game.won:
+            game.click_handle(event)
+        if event.type == pygame.QUIT:  
+            pygame.quit()
+            if game.menu.is_hosting:
+                conn.close()
+            elif game.menu.is_connected:
+                client_socket.disconnect()
+            sys.exit()
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_r:
+                tmp_connected = game.menu.is_connected
+                tmp_hosting = game.menu.is_hosting
+                game = Game()
+                game.menu.is_connected = tmp_connected
+                game.menu.is_hosting = tmp_hosting
+                if game.menu.is_connected:
+                    game.menu.btn_connect.background = c.RED
+                if game.menu.is_hosting:
+                    game.menu.btn_host.background = c.RED
+    game.set_player_ball()
+    if not game.menu.is_connected:
+        game.check_collisions()
+    game.draw_balls_pocket()
+    if (not game.menu.is_connected and not game.menu.is_hosting) or (game.menu.is_hosting and game.turn == c.PLAYER1) or (game.menu.is_connected and game.turn == c.PLAYER2):
+        game.stick.set_angle(game.balls[0])
+    time_now = pygame.time.get_ticks()
+    if  time_now > old_time + 8:
+        game.draw()
+        game.sound_effects()
+    
+    if game.menu.is_connected:
+        try:
+            data = client_socket.recv(4096)
+            if data:
+                balls_host, balls_host_even, balls_host_odd, mouse_pos, turn, pocket_type, ack = pickle.loads(data)
+                game.balls = balls_host.copy()
+                game.balls_pocket_even = balls_host_even.copy()
+                game.balls_pocket_odd = balls_host_odd.copy()
+                if game.turn == c.PLAYER1:
+                    game.stick.set_angle(game.balls[0], mouse_pos)
+                game.turn = turn
+                game.must_pocket = pocket_type
+                if ack:
+                    game.remote_force = 0
+                    game.remote_angle = 0
+                if game.stick.remote_hit:
+                    game.stick.remote_hit = False
+                    game.remote_force = game.stick.hit_force
+                    game.remote_angle = game.stick.angle
+                    print("Remote hit sent with force {} and angle {}".format(game.remote_force, game.remote_angle))
+                mouse_pos = pygame.mouse.get_pos()
+                data = pickle.dumps((game.remote_force, game.remote_angle, mouse_pos))
+                client_socket.send(data)
+        except Exception as e:
+            #print(e)
+            pass
 
-#colours
-BG = (50, 50, 50)
-RED = (255, 0, 0)
-WHITE = (255, 255, 255)
-
-#fonts
-font = pygame.font.SysFont("Lato", 30)
-large_font = pygame.font.SysFont("Lato", 60)
-
-#load images
-cue_image = pygame.image.load("C:/Users/HPWORLD/PycharmProjects/untitled3/assets/images/cue.jpg").convert_alpha()
-table_image = pygame.image.load("C:/Users/HPWORLD/PycharmProjects/untitled3/assets/images/table.jpg").convert_alpha()
-ball_images = []
-for i in range(1, 17):
-  ball_image = pygame.image.load(f"C:/Users/HPWORLD/PycharmProjects/untitled3/assets/images/ball_{i}.jpg").convert_alpha()
-  ball_images.append(ball_image)
-
-#function for outputting text onto the screen
-def draw_text(text, font, text_col, x, y):
-  img = font.render(text, True, text_col)
-  screen.blit(img, (x, y))
-
-#function for creating balls
-def create_ball(radius, pos):
-  body = pymunk.Body()
-  body.position = pos
-  shape = pymunk.Circle(body, radius)
-  shape.mass = 5
-  shape.elasticity = 0.8
-  #use pivot joint to add friction
-  pivot = pymunk.PivotJoint(static_body, body, (0, 0), (0, 0))
-  pivot.max_bias = 0 # disable joint correction
-  pivot.max_force = 1000 # emulate linear friction
-
-  space.add(body, shape, pivot)
-  return shape
-
-#setup game balls
-balls = []
-rows = 5
-#potting balls
-for col in range(5):
-  for row in range(rows):
-    pos = (250 + (col * (dia + 1)), 267 + (row * (dia + 1)) + (col * dia / 2))
-    new_ball = create_ball(dia / 2, pos)
-    balls.append(new_ball)
-  rows -= 1
-#cue ball
-pos = (888, SCREEN_HEIGHT / 2)
-cue_ball = create_ball(dia / 2, pos)
-balls.append(cue_ball)
-
-#create six pockets on table
-pockets = [
-  (55, 63),
-  (592, 48),
-  (1134, 64),
-  (55, 616),
-  (592, 629),
-  (1134, 616)
-]
-
-#create pool table cushions
-cushions = [
-  [(88, 56), (109, 77), (555, 77), (564, 56)],
-  [(621, 56), (630, 77), (1081, 77), (1102, 56)],
-  [(89, 621), (110, 600),(556, 600), (564, 621)],
-  [(622, 621), (630, 600), (1081, 600), (1102, 621)],
-  [(56, 96), (77, 117), (77, 560), (56, 581)],
-  [(1143, 96), (1122, 117), (1122, 560), (1143, 581)]
-]
-
-#function for creating cushions
-def create_cushion(poly_dims):
-  body = pymunk.Body(body_type = pymunk.Body.STATIC)
-  body.position = ((0, 0))
-  shape = pymunk.Poly(body, poly_dims)
-  shape.elasticity = 0.8
-  
-  space.add(body, shape)
-
-for c in cushions:
-  create_cushion(c)
-
-#create pool cue
-class Cue():
-  def __init__(self, pos):
-    self.original_image = cue_image
-    self.angle = 0
-    self.image = pygame.transform.rotate(self.original_image, self.angle)
-    self.rect = self.image.get_rect()
-    self.rect.center = pos
-
-  def update(self, angle):
-    self.angle = angle
-
-  def draw(self, surface):
-    self.image = pygame.transform.rotate(self.original_image, self.angle)
-    surface.blit(self.image,
-      (self.rect.centerx - self.image.get_width() / 2,
-      self.rect.centery - self.image.get_height() / 2)
-     )
-
-cue = Cue(balls[-1].body.position)
-
-#create power bars to show how hard the cue ball will be hit
-power_bar = pygame.Surface((10, 20))
-power_bar.fill(RED)
-
-#game loop
-run = True
-while run:
-
-  clock.tick(FPS)
-  space.step(1 / FPS)
-
-  #fill background
-  screen.fill(BG)
-
-  #draw pool table
-  screen.blit(table_image, (0, 0))
-
-  #check if any balls have been potted
-  for i, ball in enumerate(balls):
-    for pocket in pockets:
-      ball_x_dist = abs(ball.body.position[0] - pocket[0])
-      ball_y_dist = abs(ball.body.position[1] - pocket[1])
-      ball_dist = math.sqrt((ball_x_dist ** 2) + (ball_y_dist ** 2))
-      if ball_dist <= pocket_dia / 2:
-        #check if the potted ball was the cue ball
-        if i == len(balls) - 1:
-          lives -= 1
-          cue_ball_potted = True
-          ball.body.position = (-100, -100)
-          ball.body.velocity = (0.0, 0.0)
-        else:
-          space.remove(ball.body)
-          balls.remove(ball)
-          potted_balls.append(ball_images[i])
-          ball_images.pop(i)
-
-  #draw pool balls
-  for i, ball in enumerate(balls):
-    screen.blit(ball_images[i], (ball.body.position[0] - ball.radius, ball.body.position[1] - ball.radius))
-
-  #check if all the balls have stopped moving
-  taking_shot = True
-  for ball in balls:
-    if int(ball.body.velocity[0]) != 0 or int(ball.body.velocity[1]) != 0:
-      taking_shot = False
-
-  #draw pool cue
-  if taking_shot == True and game_running == True:
-    if cue_ball_potted == True:
-      #reposition cue ball
-      balls[-1].body.position = (888, SCREEN_HEIGHT / 2)
-      cue_ball_potted = False
-    #calculate pool cue angle
-    mouse_pos = pygame.mouse.get_pos()
-    cue.rect.center = balls[-1].body.position
-    x_dist = balls[-1].body.position[0] - mouse_pos[0]
-    y_dist = -(balls[-1].body.position[1] - mouse_pos[1]) # -ve because pygame y coordinates increase down the screen
-    cue_angle = math.degrees(math.atan2(y_dist, x_dist))
-    cue.update(cue_angle)
-    cue.draw(screen)
-
-  #power up pool cue
-  if powering_up == True and game_running == True:
-    force += 100 * force_direction
-    if force >= max_force or force <= 0:
-      force_direction *= -1
-    #draw power bars
-    for b in range(math.ceil(force / 2000)):
-      screen.blit(power_bar,
-       (balls[-1].body.position[0] - 30 + (b * 15),
-        balls[-1].body.position[1] + 30))
-  elif powering_up == False and taking_shot == True:
-    x_impulse = math.cos(math.radians(cue_angle))
-    y_impulse = math.sin(math.radians(cue_angle))
-    balls[-1].body.apply_impulse_at_local_point((force * -x_impulse, force * y_impulse), (0, 0))
-    force = 0
-    force_direction = 1
-
-  #draw bottom panel
-  pygame.draw.rect(screen, BG, (0, SCREEN_HEIGHT, SCREEN_WIDTH, BOTTOM_PANEL))
-  draw_text("LIVES: " + str(lives), font, WHITE, SCREEN_WIDTH - 200, SCREEN_HEIGHT + 10)
-
-  #draw potted balls in bottom panel
-  for i, ball in enumerate(potted_balls):
-    screen.blit(ball, (10 + (i * 50), SCREEN_HEIGHT + 10))
-
-  #check for game over
-  if lives <= 0:
-    draw_text("GAME OVER", large_font, WHITE, SCREEN_WIDTH / 2 - 160, SCREEN_HEIGHT / 2 - 100)
-    game_running = False
-
-  #check if all balls are potted
-  if len(balls) == 1:
-    draw_text("YOU WIN!", large_font, WHITE, SCREEN_WIDTH / 2 - 160, SCREEN_HEIGHT / 2 - 100)
-    game_running = False
-
-  #event handler
-  for event in pygame.event.get():
-    if event.type == pygame.MOUSEBUTTONDOWN and taking_shot == True:
-      powering_up = True
-    if event.type == pygame.MOUSEBUTTONUP and taking_shot == True:
-      powering_up = False
-    if event.type == pygame.QUIT:
-      run = False
-
-  #space.debug_draw(draw_options)
-  pygame.display.update()
-
-pygame.quit()
+    if game.menu.is_hosting:
+        mouse_pos = pygame.mouse.get_pos()
+        data = pickle.dumps((game.balls, game.balls_pocket_even, game.balls_pocket_odd, mouse_pos, game.turn, game.must_pocket, game.acknowledge))
+        try:
+            conn.send(data)
+            data = conn.recv(4096)
+            if data:
+                force, angle, mouse_pos = pickle.loads(data)
+                if force and game.turn == c.PLAYER2 and not game.has_movement(game.balls):
+                    game.balls[0].set_force_angle(force, angle)
+                    game.stick.hit = False
+                    game.after_hit = True
+                    game.acknowledge = True
+                else:
+                    game.acknowledge = False
+                if game.turn == c.PLAYER2:
+                    game.stick.set_angle(game.balls[0], mouse_pos)
+        except Exception as e:
+            #print(e)
+            pass
+    clock.tick()
+    # Update the screen
+    if  time_now > old_time + 8:
+        old_time = time_now
+        pygame.display.flip()
